@@ -33,7 +33,8 @@ detect_mo() {
 write_raycast_script() {
     local target="$1"
     local title="$2"
-    local command="$3"
+    local mo_bin="$3"
+    local subcommand="$4"
     cat > "$target" <<EOF
 #!/bin/bash
 
@@ -48,19 +49,15 @@ write_raycast_script() {
 
 set -euo pipefail
 
-MO_CMD="${command}"
-
 echo "🐹 Running ${title}..."
 echo ""
-eval "\$MO_CMD"
+"${mo_bin}" ${subcommand}
 EOF
     chmod +x "$target"
 }
 
 create_raycast_commands() {
     local mo_bin="$1"
-    local clean_cmd="\"${mo_bin}\" clean"
-    local uninstall_cmd="\"${mo_bin}\" uninstall"
     local default_dir="$HOME/Library/Application Support/Raycast/script-commands"
     local alt_dir="$HOME/Documents/Raycast/Scripts"
     local dirs=()
@@ -78,8 +75,8 @@ create_raycast_commands() {
     log_step "Installing Raycast commands..."
     for dir in "${dirs[@]}"; do
         mkdir -p "$dir"
-        write_raycast_script "$dir/mole-clean.sh" "Clean Mac" "$clean_cmd"
-        write_raycast_script "$dir/mole-uninstall.sh" "Uninstall Apps" "$uninstall_cmd"
+        write_raycast_script "$dir/mole-clean.sh" "Clean Mac" "$mo_bin" "clean"
+        write_raycast_script "$dir/mole-uninstall.sh" "Uninstall Apps" "$mo_bin" "uninstall"
         log_success "Scripts ready in: $dir"
     done
 
