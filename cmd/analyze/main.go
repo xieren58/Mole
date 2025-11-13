@@ -1,8 +1,13 @@
+//go:build darwin
+
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -10,21 +15,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 const (
-	maxEntries       = 20
-	maxLargeFiles    = 20
-	barWidth         = 24
-	minLargeFileSize = 100 << 20 // 100 MB
-	entryViewport    = 10
-	largeViewport    = 10
+	maxEntries            = 20
+	maxLargeFiles         = 20
+	barWidth              = 24
+	minLargeFileSize      = 100 << 20 // 100 MB
+	entryViewport         = 10
+	largeViewport         = 10
+	overviewCacheTTL      = 7 * 24 * time.Hour // 7 days
+	overviewCacheFile     = "overview_sizes.json"
+	duTimeout             = 60 * time.Second // Increased for large directories
+	mdlsTimeout           = 5 * time.Second
+	maxConcurrentOverview = 3   // Scan up to 3 overview dirs concurrently
+	pathUpdateInterval    = 500 // Update current path every N files
+	batchUpdateSize       = 100 // Batch atomic updates every N items
 )
 
 // Directories to fold: calculate size but don't expand children
@@ -99,6 +113,18 @@ var skipExtensions = map[string]bool{
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"}
 
+type overviewSizeSnapshot struct {
+	Size    int64     `json:"size"`
+	Updated time.Time `json:"updated"`
+}
+
+var (
+	overviewSnapshotMu      sync.Mutex
+	overviewSnapshotCache   map[string]overviewSizeSnapshot
+	overviewSnapshotLoaded  bool
+	overviewSnapshotPathErr error
+)
+
 const (
 	colorPurple = "\033[0;35m"
 	colorBlue   = "\033[0;34m"
@@ -115,10 +141,11 @@ const (
 )
 
 type dirEntry struct {
-	name  string
-	path  string
-	size  int64
-	isDir bool
+	name       string
+	path       string
+	size       int64
+	isDir      bool
+	lastAccess time.Time
 }
 
 type fileEntry struct {
@@ -158,30 +185,45 @@ type scanResultMsg struct {
 	err    error
 }
 
+type overviewSizeMsg struct {
+	path  string
+	index int
+	size  int64
+	err   error
+}
+
 type tickMsg time.Time
 
 type model struct {
-	path           string
-	history        []historyEntry
-	entries        []dirEntry
-	largeFiles     []fileEntry
-	selected       int
-	offset         int
-	status         string
-	totalSize      int64
-	scanning       bool
-	spinner        int
-	filesScanned   *int64
-	dirsScanned    *int64
-	bytesScanned   *int64
-	currentPath    *string
-	showLargeFiles bool
-	isOverview     bool
-	deleteConfirm  bool
-	deleteTarget   *dirEntry
-	cache          map[string]historyEntry
-	largeSelected  int
-	largeOffset    int
+	path                 string
+	history              []historyEntry
+	entries              []dirEntry
+	largeFiles           []fileEntry
+	selected             int
+	offset               int
+	status               string
+	totalSize            int64
+	scanning             bool
+	spinner              int
+	filesScanned         *int64
+	dirsScanned          *int64
+	bytesScanned         *int64
+	currentPath          *string
+	showLargeFiles       bool
+	isOverview           bool
+	showFlameGraph       bool
+	deleteConfirm        bool
+	deleteTarget         *dirEntry
+	cache                map[string]historyEntry
+	largeSelected        int
+	largeOffset          int
+	overviewSizeCache    map[string]int64
+	overviewFilesScanned *int64
+	overviewDirsScanned  *int64
+	overviewBytesScanned *int64
+	overviewCurrentPath  *string
+	overviewScanning     bool
+	overviewScanningSet  map[string]bool // Track which paths are currently being scanned
 }
 
 func main() {
@@ -217,26 +259,41 @@ func main() {
 func newModel(path string, isOverview bool) model {
 	var filesScanned, dirsScanned, bytesScanned int64
 	currentPath := ""
+	var overviewFilesScanned, overviewDirsScanned, overviewBytesScanned int64
+	overviewCurrentPath := ""
 
 	m := model{
-		path:           path,
-		selected:       0,
-		status:         "Preparing scan...",
-		scanning:       !isOverview,
-		filesScanned:   &filesScanned,
-		dirsScanned:    &dirsScanned,
-		bytesScanned:   &bytesScanned,
-		currentPath:    &currentPath,
-		showLargeFiles: false,
-		isOverview:     isOverview,
-		cache:          make(map[string]historyEntry),
+		path:                 path,
+		selected:             0,
+		status:               "Preparing scan...",
+		scanning:             !isOverview,
+		filesScanned:         &filesScanned,
+		dirsScanned:          &dirsScanned,
+		bytesScanned:         &bytesScanned,
+		currentPath:          &currentPath,
+		showLargeFiles:       false,
+		isOverview:           isOverview,
+		cache:                make(map[string]historyEntry),
+		overviewFilesScanned: &overviewFilesScanned,
+		overviewDirsScanned:  &overviewDirsScanned,
+		overviewBytesScanned: &overviewBytesScanned,
+		overviewCurrentPath:  &overviewCurrentPath,
 	}
 
 	// In overview mode, create shortcut entries
 	if isOverview {
 		m.scanning = false
-		m.entries = createOverviewEntries()
-		m.status = "Ready"
+		m.overviewSizeCache = make(map[string]int64)
+		m.overviewScanningSet = make(map[string]bool)
+		m.hydrateOverviewEntries()
+		m.selected = 0
+		m.offset = 0
+		if nextPendingOverviewIndex(m.entries) >= 0 {
+			m.overviewScanning = true
+			m.status = "Estimating system roots..."
+		} else {
+			m.status = "Ready"
+		}
 	}
 
 	return m
@@ -244,24 +301,149 @@ func newModel(path string, isOverview bool) model {
 
 func createOverviewEntries() []dirEntry {
 	home := os.Getenv("HOME")
-	entries := []dirEntry{
-		{name: "Home (~)", path: home, isDir: true},
-		{name: "Library (~/Library)", path: filepath.Join(home, "Library"), isDir: true},
-		{name: "Applications", path: "/Applications", isDir: true},
-		{name: "System Library", path: "/Library", isDir: true},
+	entries := []dirEntry{}
+
+	if home != "" {
+		entries = append(entries,
+			dirEntry{name: "Home (~)", path: home, isDir: true, size: -1},
+			dirEntry{name: "Library (~/Library)", path: filepath.Join(home, "Library"), isDir: true, size: -1},
+		)
 	}
+
+	entries = append(entries,
+		dirEntry{name: "Applications", path: "/Applications", isDir: true, size: -1},
+		dirEntry{name: "System Library", path: "/Library", isDir: true, size: -1},
+	)
 
 	// Add Volumes if exists
 	if _, err := os.Stat("/Volumes"); err == nil {
-		entries = append(entries, dirEntry{name: "Volumes", path: "/Volumes", isDir: true})
+		entries = append(entries, dirEntry{name: "Volumes", path: "/Volumes", isDir: true, size: -1})
 	}
 
 	return entries
 }
 
+func (m *model) hydrateOverviewEntries() {
+	m.entries = createOverviewEntries()
+	if m.overviewSizeCache == nil {
+		m.overviewSizeCache = make(map[string]int64)
+	}
+	for i := range m.entries {
+		if size, ok := m.overviewSizeCache[m.entries[i].path]; ok {
+			m.entries[i].size = size
+			continue
+		}
+		if size, err := loadOverviewCachedSize(m.entries[i].path); err == nil {
+			m.entries[i].size = size
+			m.overviewSizeCache[m.entries[i].path] = size
+		}
+	}
+	m.totalSize = sumKnownEntrySizes(m.entries)
+}
+
+func (m *model) scheduleOverviewScans() tea.Cmd {
+	if !m.isOverview {
+		return nil
+	}
+
+	// Initialize scanning set if needed
+	if m.overviewScanningSet == nil {
+		m.overviewScanningSet = make(map[string]bool)
+	}
+
+	// Find pending entries (not scanned and not currently scanning)
+	var pendingIndices []int
+	for i, entry := range m.entries {
+		if entry.size < 0 && !m.overviewScanningSet[entry.path] {
+			pendingIndices = append(pendingIndices, i)
+			if len(pendingIndices) >= maxConcurrentOverview {
+				break
+			}
+		}
+	}
+
+	// No more work to do
+	if len(pendingIndices) == 0 {
+		m.overviewScanning = false
+		if !hasPendingOverviewEntries(m.entries) {
+			m.status = "Ready"
+		}
+		return nil
+	}
+
+	// Mark all as scanning
+	var cmds []tea.Cmd
+	for _, idx := range pendingIndices {
+		entry := m.entries[idx]
+		m.overviewScanningSet[entry.path] = true
+		cmd := scanOverviewPathCmd(entry.path, idx)
+		cmds = append(cmds, cmd)
+	}
+
+	m.overviewScanning = true
+	remaining := 0
+	for _, e := range m.entries {
+		if e.size < 0 {
+			remaining++
+		}
+	}
+	if len(pendingIndices) > 0 {
+		firstEntry := m.entries[pendingIndices[0]]
+		if len(pendingIndices) == 1 {
+			m.status = fmt.Sprintf("Scanning %s... (%d left)", firstEntry.name, remaining)
+		} else {
+			m.status = fmt.Sprintf("Scanning %d directories... (%d left)", len(pendingIndices), remaining)
+		}
+	}
+
+	cmds = append(cmds, tickCmd())
+	return tea.Batch(cmds...)
+}
+
+func (m *model) updateScanProgress(files, dirs, bytes int64, path string) {
+	if m.filesScanned != nil {
+		atomic.StoreInt64(m.filesScanned, files)
+	}
+	if m.dirsScanned != nil {
+		atomic.StoreInt64(m.dirsScanned, dirs)
+	}
+	if m.bytesScanned != nil {
+		atomic.StoreInt64(m.bytesScanned, bytes)
+	}
+	if m.currentPath != nil && path != "" {
+		*m.currentPath = path
+	}
+}
+
+func (m *model) getScanProgress() (files, dirs, bytes int64) {
+	if m.filesScanned != nil {
+		files = atomic.LoadInt64(m.filesScanned)
+	}
+	if m.dirsScanned != nil {
+		dirs = atomic.LoadInt64(m.dirsScanned)
+	}
+	if m.bytesScanned != nil {
+		bytes = atomic.LoadInt64(m.bytesScanned)
+	}
+	return
+}
+
+func (m *model) getOverviewScanProgress() (files, dirs, bytes int64) {
+	if m.overviewFilesScanned != nil {
+		files = atomic.LoadInt64(m.overviewFilesScanned)
+	}
+	if m.overviewDirsScanned != nil {
+		dirs = atomic.LoadInt64(m.overviewDirsScanned)
+	}
+	if m.overviewBytesScanned != nil {
+		bytes = atomic.LoadInt64(m.overviewBytesScanned)
+	}
+	return
+}
+
 func (m model) Init() tea.Cmd {
 	if m.isOverview {
-		return nil
+		return m.scheduleOverviewScans()
 	}
 	return tea.Batch(m.scanCmd(m.path), tickCmd())
 }
@@ -313,9 +495,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampEntrySelection()
 		m.clampLargeSelection()
 		m.cache[m.path] = cacheSnapshot(m)
+		if m.totalSize > 0 {
+			if m.overviewSizeCache == nil {
+				m.overviewSizeCache = make(map[string]int64)
+			}
+			m.overviewSizeCache[m.path] = m.totalSize
+			go func(path string, size int64) {
+				_ = storeOverviewSize(path, size)
+			}(m.path, m.totalSize)
+		}
+		return m, nil
+	case overviewSizeMsg:
+		if m.overviewSizeCache == nil {
+			m.overviewSizeCache = make(map[string]int64)
+		}
+		if m.overviewScanningSet == nil {
+			m.overviewScanningSet = make(map[string]bool)
+		}
+
+		// Remove from scanning set
+		delete(m.overviewScanningSet, msg.path)
+
+		if msg.err == nil {
+			m.overviewSizeCache[msg.path] = msg.size
+		}
+
+		if m.isOverview {
+			// Update entry with result
+			for i := range m.entries {
+				if m.entries[i].path == msg.path {
+					if msg.err == nil {
+						m.entries[i].size = msg.size
+					} else {
+						m.entries[i].size = 0
+					}
+					break
+				}
+			}
+			m.totalSize = sumKnownEntrySizes(m.entries)
+
+			// Show error briefly if any
+			if msg.err != nil {
+				m.status = fmt.Sprintf("Unable to measure %s: %v", displayPath(msg.path), msg.err)
+			}
+
+			// Schedule next batch of scans
+			cmd := m.scheduleOverviewScans()
+			return m, cmd
+		}
 		return m, nil
 	case tickMsg:
-		if m.scanning {
+		if m.scanning || (m.isOverview && m.overviewScanning) {
 			m.spinner = (m.spinner + 1) % len(spinnerFrames)
 			return m, tickCmd()
 		}
@@ -377,6 +607,10 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showLargeFiles = false
 			return m, nil
 		}
+		if m.showFlameGraph {
+			m.showFlameGraph = false
+			return m, nil
+		}
 		return m, tea.Quit
 	case "up", "k":
 		if m.showLargeFiles {
@@ -421,16 +655,14 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showLargeFiles = false
 			return m, nil
 		}
+		if m.showFlameGraph {
+			m.showFlameGraph = false
+			return m, nil
+		}
 		if len(m.history) == 0 {
 			// Return to overview if at top level
 			if !m.isOverview {
-				m.isOverview = true
-				m.path = "/"
-				m.entries = createOverviewEntries()
-				m.selected = 0
-				m.offset = 0
-				m.status = "Ready"
-				m.scanning = false
+				return m, m.switchToOverviewMode()
 			}
 			return m, nil
 		}
@@ -469,10 +701,18 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.scanCmd(m.path), tickCmd())
 	case "l":
 		m.showLargeFiles = !m.showLargeFiles
+		m.showFlameGraph = false
 		if m.showLargeFiles {
 			m.largeSelected = 0
 			m.largeOffset = 0
 		}
+	case "g", "v":
+		// Toggle flame graph view
+		if m.isOverview {
+			return m, nil // Flame graph not available in overview mode
+		}
+		m.showFlameGraph = !m.showFlameGraph
+		m.showLargeFiles = false
 	case "o":
 		// Open selected entry
 		if m.showLargeFiles {
@@ -483,7 +723,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}()
 				m.status = fmt.Sprintf("Opening %s...", selected.name)
 			}
-		} else if len(m.entries) > 0 && !m.isOverview {
+		} else if len(m.entries) > 0 {
 			selected := m.entries[m.selected]
 			go func() {
 				_ = exec.Command("open", selected.path).Run()
@@ -500,7 +740,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}(selected.path)
 				m.status = fmt.Sprintf("Revealing %s in Finder...", selected.name)
 			}
-		} else if len(m.entries) > 0 && !m.isOverview {
+		} else if len(m.entries) > 0 {
 			selected := m.entries[m.selected]
 			go func(path string) {
 				_ = exec.Command("open", "-R", path).Run()
@@ -527,6 +767,32 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) switchToOverviewMode() tea.Cmd {
+	if m.overviewSizeCache == nil {
+		m.overviewSizeCache = make(map[string]int64)
+	}
+	if m.overviewScanningSet == nil {
+		m.overviewScanningSet = make(map[string]bool)
+	}
+	m.isOverview = true
+	m.path = "/"
+	m.scanning = false
+	m.showLargeFiles = false
+	m.largeFiles = nil
+	m.largeSelected = 0
+	m.largeOffset = 0
+	m.deleteConfirm = false
+	m.deleteTarget = nil
+	m.selected = 0
+	m.offset = 0
+	m.hydrateOverviewEntries()
+	cmd := m.scheduleOverviewScans()
+	if cmd == nil {
+		m.status = "Ready"
+	}
+	return cmd
 }
 
 func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
@@ -568,6 +834,37 @@ func (m model) View() string {
 	var b strings.Builder
 	fmt.Fprintln(&b)
 
+	// Visualization removed - will be redesigned
+	_ = m.showFlameGraph
+
+	if m.isOverview && hasPendingOverviewEntries(m.entries) {
+		fmt.Fprintf(&b, "%sAnalyze Disk%s\n", colorPurple, colorReset)
+		fmt.Fprintf(&b, "%sPreparing overview...%s\n\n", colorGray, colorReset)
+
+		filesScanned, dirsScanned, bytesScanned := m.getOverviewScanProgress()
+
+		fmt.Fprintf(&b, "%s%s%s%s Scanning: %s%s files%s, %s%s dirs%s, %s%s%s\n",
+			colorCyan, colorBold,
+			spinnerFrames[m.spinner],
+			colorReset,
+			colorYellow, formatNumber(filesScanned), colorReset,
+			colorYellow, formatNumber(dirsScanned), colorReset,
+			colorGreen, humanizeBytes(bytesScanned), colorReset)
+
+		if m.overviewCurrentPath != nil {
+			currentPath := *m.overviewCurrentPath
+			if currentPath != "" {
+				shortPath := displayPath(currentPath)
+				if len(shortPath) > 60 {
+					shortPath = "..." + shortPath[len(shortPath)-57:]
+				}
+				fmt.Fprintf(&b, "%s%s%s\n", colorGray, shortPath, colorReset)
+			}
+		}
+
+		return b.String()
+	}
+
 	if m.deleteConfirm && m.deleteTarget != nil {
 		// Show delete confirmation prominently at the top
 		fmt.Fprintf(&b, "%sDelete: %s (%s)? Press Delete again to confirm, ESC to cancel%s\n\n",
@@ -586,9 +883,7 @@ func (m model) View() string {
 	}
 
 	if m.scanning {
-		filesScanned := atomic.LoadInt64(m.filesScanned)
-		dirsScanned := atomic.LoadInt64(m.dirsScanned)
-		bytesScanned := atomic.LoadInt64(m.bytesScanned)
+		filesScanned, dirsScanned, bytesScanned := m.getScanProgress()
 
 		fmt.Fprintf(&b, "\n%s%s%s%s Scanning: %s%s files%s, %s%s dirs%s, %s%s%s\n",
 			colorCyan, colorBold,
@@ -598,13 +893,15 @@ func (m model) View() string {
 			colorYellow, formatNumber(dirsScanned), colorReset,
 			colorGreen, humanizeBytes(bytesScanned), colorReset)
 
-		currentPath := *m.currentPath
-		if currentPath != "" {
-			shortPath := displayPath(currentPath)
-			if len(shortPath) > 60 {
-				shortPath = "..." + shortPath[len(shortPath)-57:]
+		if m.currentPath != nil {
+			currentPath := *m.currentPath
+			if currentPath != "" {
+				shortPath := displayPath(currentPath)
+				if len(shortPath) > 60 {
+					shortPath = "..." + shortPath[len(shortPath)-57:]
+				}
+				fmt.Fprintf(&b, "%s%s%s\n", colorGray, shortPath, colorReset)
 			}
-			fmt.Fprintf(&b, "%s%s%s\n", colorGray, shortPath, colorReset)
 		}
 
 		return b.String()
@@ -643,7 +940,7 @@ func (m model) View() string {
 				nameColumn := padName(shortPath, 56)
 				size := humanizeBytes(file.size)
 				bar := coloredProgressBar(file.size, maxLargeSize, 0)
-				fmt.Fprintf(&b, "%s%2d) %s  |  📄 %s %s%10s%s\n",
+				fmt.Fprintf(&b, "%s%2d. %s  |  📄 %s %s%10s%s\n",
 					entryPrefix, idx+1, bar, nameColumn, colorGray, size, colorReset)
 			}
 		}
@@ -652,14 +949,76 @@ func (m model) View() string {
 			fmt.Fprintln(&b, "  Empty directory")
 		} else {
 			if m.isOverview {
-				// In overview mode, show simple list without sizes
+				maxSize := int64(1)
+				for _, entry := range m.entries {
+					if entry.size > maxSize {
+						maxSize = entry.size
+					}
+				}
+				totalSize := m.totalSize
 				for idx, entry := range m.entries {
-					displayIndex := idx + 1
-					if idx == m.selected {
-						// Highlight selected entry
-						fmt.Fprintf(&b, " %s%s▶ %d) 📁 %s%s\n", colorCyan, colorBold, displayIndex, entry.name, colorReset)
+					icon := "📁"
+					sizeVal := entry.size
+					barValue := sizeVal
+					if barValue < 0 {
+						barValue = 0
+					}
+					var percent float64
+					if totalSize > 0 && sizeVal >= 0 {
+						percent = float64(sizeVal) / float64(totalSize) * 100
 					} else {
-						fmt.Fprintf(&b, "   %d) 📁 %s\n", displayIndex, entry.name)
+						percent = 0
+					}
+					percentStr := fmt.Sprintf("%5.1f%%", percent)
+					if totalSize == 0 || sizeVal < 0 {
+						percentStr = "  --  "
+					}
+					bar := coloredProgressBar(barValue, maxSize, percent)
+					sizeText := "pending.."
+					if sizeVal >= 0 {
+						sizeText = humanizeBytes(sizeVal)
+					}
+					sizeColor := colorGray
+					if sizeVal >= 0 && totalSize > 0 {
+						switch {
+						case percent >= 50:
+							sizeColor = colorRed
+						case percent >= 20:
+							sizeColor = colorYellow
+						case percent >= 5:
+							sizeColor = colorCyan
+						default:
+							sizeColor = colorGray
+						}
+					}
+					entryPrefix := "    "
+					name := trimName(entry.name)
+					paddedName := padName(name, 28)
+					nameSegment := fmt.Sprintf("%s %s", icon, paddedName)
+					if idx == m.selected {
+						entryPrefix = fmt.Sprintf(" %s%s▶%s  ", colorCyan, colorBold, colorReset)
+						nameSegment = fmt.Sprintf("%s%s %s%s", colorBold, icon, paddedName, colorReset)
+					}
+					displayIndex := idx + 1
+
+					// Add unused time label if applicable
+					// For overview mode, get access time on-demand if not set and cache it
+					lastAccess := entry.lastAccess
+					if lastAccess.IsZero() && entry.path != "" {
+						lastAccess = getLastAccessTime(entry.path)
+						// Cache the result to avoid repeated syscalls
+						m.entries[idx].lastAccess = lastAccess
+					}
+					unusedLabel := formatUnusedTime(lastAccess)
+					if unusedLabel == "" {
+						fmt.Fprintf(&b, "%s%2d. %s %s  |  %s %s%10s%s\n",
+							entryPrefix, displayIndex, bar, percentStr,
+							nameSegment, sizeColor, sizeText, colorReset)
+					} else {
+						fmt.Fprintf(&b, "%s%2d. %s %s  |  %s %s%10s%s  %s%s%s\n",
+							entryPrefix, displayIndex, bar, percentStr,
+							nameSegment, sizeColor, sizeText, colorReset,
+							colorGray, unusedLabel, colorReset)
 					}
 				}
 			} else {
@@ -718,9 +1077,19 @@ func (m model) View() string {
 					}
 
 					displayIndex := idx + 1
-					fmt.Fprintf(&b, "%s%2d) %s %s  |  %s %s%10s%s\n",
-						entryPrefix, displayIndex, bar, percentStr,
-						nameSegment, sizeColor, size, colorReset)
+
+					// Add unused time label if applicable
+					unusedLabel := formatUnusedTime(entry.lastAccess)
+					if unusedLabel == "" {
+						fmt.Fprintf(&b, "%s%2d. %s %s  |  %s %s%10s%s\n",
+							entryPrefix, displayIndex, bar, percentStr,
+							nameSegment, sizeColor, size, colorReset)
+					} else {
+						fmt.Fprintf(&b, "%s%2d. %s %s  |  %s %s%10s%s  %s%s%s\n",
+							entryPrefix, displayIndex, bar, percentStr,
+							nameSegment, sizeColor, size, colorReset,
+							colorGray, unusedLabel, colorReset)
+					}
 				}
 			}
 		}
@@ -728,15 +1097,15 @@ func (m model) View() string {
 
 	fmt.Fprintln(&b)
 	if m.isOverview {
-		fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  Q Quit%s\n", colorGray, colorReset)
+		fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  Enter Explore  |  O Open  |  F Reveal  |  Q Quit%s\n", colorGray, colorReset)
 	} else if m.showLargeFiles {
 		fmt.Fprintf(&b, "%s  ↑↓ Navigate  |  O Open  |  F Reveal  |  ⌫ Delete  |  Q Quit%s\n", colorGray, colorReset)
 	} else {
 		largeFileCount := len(m.largeFiles)
 		if largeFileCount > 0 {
-			fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  O Open  |  F Reveal  |  ⌫ Delete  |  L Large(%d)  |  Q Quit%s\n", colorGray, largeFileCount, colorReset)
+			fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  O Open  |  F Reveal  |  ⌫ Delete  |  G FlameGraph  |  L Large(%d)  |  Q Quit%s\n", colorGray, largeFileCount, colorReset)
 		} else {
-			fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  O Open  |  F Reveal  |  ⌫ Delete  |  Q Quit%s\n", colorGray, colorReset)
+			fmt.Fprintf(&b, "%s  ↑↓←→ Navigate  |  O Open  |  F Reveal  |  ⌫ Delete  |  G FlameGraph  |  Q Quit%s\n", colorGray, colorReset)
 		}
 	}
 	return b.String()
@@ -791,15 +1160,16 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					size := calculateDirSizeFast(path, filesScanned, dirsScanned, bytesScanned)
+					size := calculateDirSizeFast(path, filesScanned, dirsScanned, bytesScanned, currentPath)
 					atomic.AddInt64(&total, size)
 					atomic.AddInt64(dirsScanned, 1)
 
 					entry := dirEntry{
-						name:  name,
-						path:  path,
-						size:  size,
-						isDir: true,
+						name:       name,
+						path:       path,
+						size:       size,
+						isDir:      true,
+						lastAccess: getLastAccessTime(path),
 					}
 					entriesMu.Lock()
 					entries = append(entries, entry)
@@ -820,10 +1190,11 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 				atomic.AddInt64(dirsScanned, 1)
 
 				entry := dirEntry{
-					name:  name,
-					path:  path,
-					size:  size,
-					isDir: true,
+					name:       name,
+					path:       path,
+					size:       size,
+					isDir:      true,
+					lastAccess: getLastAccessTime(path),
 				}
 				entriesMu.Lock()
 				entries = append(entries, entry)
@@ -842,10 +1213,11 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 		atomic.AddInt64(bytesScanned, size)
 
 		entries = append(entries, dirEntry{
-			name:  child.Name(),
-			path:  fullPath,
-			size:  size,
-			isDir: false,
+			name:       child.Name(),
+			path:       fullPath,
+			size:       size,
+			isDir:      false,
+			lastAccess: getLastAccessTime(fullPath),
 		})
 		// Only track large files that are not code/text files
 		if !shouldSkipFileForLargeTracking(fullPath) {
@@ -887,8 +1259,9 @@ func shouldSkipFileForLargeTracking(path string) bool {
 	return skipExtensions[ext]
 }
 
-// Fast directory size calculation (no detailed tracking, no large files)
-func calculateDirSizeFast(root string, filesScanned, dirsScanned, bytesScanned *int64) int64 {
+// calculateDirSizeFast performs fast directory size calculation without detailed tracking or large file detection.
+// Updates progress counters in batches to reduce atomic operation overhead.
+func calculateDirSizeFast(root string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *string) int64 {
 	var total int64
 	var localFiles, localDirs int64
 	var batchBytes int64
@@ -899,9 +1272,9 @@ func calculateDirSizeFast(root string, filesScanned, dirsScanned, bytesScanned *
 		}
 		if d.IsDir() {
 			localDirs++
-			// Batch update every 100 dirs to reduce atomic operations
-			if localDirs%100 == 0 {
-				atomic.AddInt64(dirsScanned, 100)
+			// Batch update every N dirs to reduce atomic operations
+			if localDirs%batchUpdateSize == 0 {
+				atomic.AddInt64(dirsScanned, batchUpdateSize)
 				localDirs = 0
 			}
 			return nil
@@ -914,9 +1287,12 @@ func calculateDirSizeFast(root string, filesScanned, dirsScanned, bytesScanned *
 		total += size
 		batchBytes += size
 		localFiles++
-		// Batch update every 100 files to reduce atomic operations
-		if localFiles%100 == 0 {
-			atomic.AddInt64(filesScanned, 100)
+		if currentPath != nil {
+			*currentPath = path
+		}
+		// Batch update every N files to reduce atomic operations
+		if localFiles%batchUpdateSize == 0 {
+			atomic.AddInt64(filesScanned, batchUpdateSize)
 			atomic.AddInt64(bytesScanned, batchBytes)
 			localFiles = 0
 			batchBytes = 0
@@ -1018,9 +1394,9 @@ func calculateDirSizeConcurrent(root string, tracker *largeFileTracker, filesSca
 				return filepath.SkipDir
 			}
 			localDirs++
-			// Batch update every 50 dirs to reduce atomic operations
-			if localDirs%50 == 0 {
-				atomic.AddInt64(dirsScanned, 50)
+			// Batch update every N dirs to reduce atomic operations
+			if localDirs%batchUpdateSize == 0 {
+				atomic.AddInt64(dirsScanned, batchUpdateSize)
 				localDirs = 0
 			}
 			return nil
@@ -1034,9 +1410,9 @@ func calculateDirSizeConcurrent(root string, tracker *largeFileTracker, filesSca
 		batchBytes += size
 		localFiles++
 
-		// Batch update every 50 files to reduce atomic operations
-		if localFiles%50 == 0 {
-			atomic.AddInt64(filesScanned, 50)
+		// Batch update every N files to reduce atomic operations
+		if localFiles%batchUpdateSize == 0 {
+			atomic.AddInt64(filesScanned, batchUpdateSize)
 			atomic.AddInt64(bytesScanned, batchBytes)
 			localFiles = 0
 			batchBytes = 0
@@ -1047,9 +1423,9 @@ func calculateDirSizeConcurrent(root string, tracker *largeFileTracker, filesSca
 			tracker.add(fileEntry{name: filepath.Base(path), path: path, size: size})
 		}
 
-		// Update current path every 500 files to reduce contention
+		// Update current path periodically to reduce contention
 		updateCounter++
-		if updateCounter%500 == 0 {
+		if updateCounter%pathUpdateInterval == 0 && currentPath != nil {
 			*currentPath = path
 		}
 
@@ -1071,10 +1447,10 @@ func calculateDirSizeConcurrent(root string, tracker *largeFileTracker, filesSca
 }
 
 type largeFileTracker struct {
-	mu         sync.Mutex
-	entries    []fileEntry
-	minSize    int64
-	needsSort  bool
+	mu        sync.Mutex
+	entries   []fileEntry
+	minSize   int64
+	needsSort bool
 }
 
 func newLargeFileTracker() *largeFileTracker {
@@ -1361,6 +1737,323 @@ func cloneFileEntries(files []fileEntry) []fileEntry {
 	return copied
 }
 
+func sumKnownEntrySizes(entries []dirEntry) int64 {
+	var total int64
+	for _, entry := range entries {
+		if entry.size > 0 {
+			total += entry.size
+		}
+	}
+	return total
+}
+
+func nextPendingOverviewIndex(entries []dirEntry) int {
+	for i, entry := range entries {
+		if entry.size < 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasPendingOverviewEntries(entries []dirEntry) bool {
+	for _, entry := range entries {
+		if entry.size < 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureOverviewSnapshotCacheLocked() error {
+	if overviewSnapshotLoaded {
+		return nil
+	}
+	storePath, err := getOverviewSizeStorePath()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
+			overviewSnapshotLoaded = true
+			return nil
+		}
+		return err
+	}
+	if len(data) == 0 {
+		overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
+		overviewSnapshotLoaded = true
+		return nil
+	}
+	var snapshots map[string]overviewSizeSnapshot
+	if err := json.Unmarshal(data, &snapshots); err != nil || snapshots == nil {
+		// File is corrupted, rename it instead of silently discarding
+		backupPath := storePath + ".corrupt"
+		_ = os.Rename(storePath, backupPath)
+		overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
+		overviewSnapshotLoaded = true
+		return nil
+	}
+	overviewSnapshotCache = snapshots
+	overviewSnapshotLoaded = true
+	return nil
+}
+
+func getOverviewSizeStorePath() (string, error) {
+	cacheDir, err := getCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "overview_sizes.json"), nil
+}
+
+// loadStoredOverviewSize retrieves cached directory size from JSON cache.
+// Returns error if cache is missing or expired (older than overviewCacheTTL).
+func loadStoredOverviewSize(path string) (int64, error) {
+	if path == "" {
+		return 0, fmt.Errorf("empty path")
+	}
+	overviewSnapshotMu.Lock()
+	defer overviewSnapshotMu.Unlock()
+	if err := ensureOverviewSnapshotCacheLocked(); err != nil {
+		return 0, err
+	}
+	if overviewSnapshotCache == nil {
+		return 0, fmt.Errorf("snapshot cache unavailable")
+	}
+	if snapshot, ok := overviewSnapshotCache[path]; ok && snapshot.Size > 0 {
+		// Check if cache is still valid
+		if time.Since(snapshot.Updated) < overviewCacheTTL {
+			return snapshot.Size, nil
+		}
+		return 0, fmt.Errorf("snapshot expired")
+	}
+	return 0, fmt.Errorf("snapshot not found")
+}
+
+// storeOverviewSize saves directory size to JSON cache with current timestamp.
+func storeOverviewSize(path string, size int64) error {
+	if path == "" || size <= 0 {
+		return fmt.Errorf("invalid overview size")
+	}
+	overviewSnapshotMu.Lock()
+	defer overviewSnapshotMu.Unlock()
+	if err := ensureOverviewSnapshotCacheLocked(); err != nil {
+		return err
+	}
+	if overviewSnapshotCache == nil {
+		overviewSnapshotCache = make(map[string]overviewSizeSnapshot)
+	}
+	overviewSnapshotCache[path] = overviewSizeSnapshot{
+		Size:    size,
+		Updated: time.Now(),
+	}
+	return persistOverviewSnapshotLocked()
+}
+
+func persistOverviewSnapshotLocked() error {
+	storePath, err := getOverviewSizeStorePath()
+	if err != nil {
+		return err
+	}
+	tmpPath := storePath + ".tmp"
+	data, err := json.MarshalIndent(overviewSnapshotCache, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, storePath)
+}
+
+func loadOverviewCachedSize(path string) (int64, error) {
+	if path == "" {
+		return 0, fmt.Errorf("empty path")
+	}
+	if snapshot, err := loadStoredOverviewSize(path); err == nil {
+		return snapshot, nil
+	}
+	cacheEntry, err := loadCacheFromDisk(path)
+	if err != nil {
+		return 0, err
+	}
+	_ = storeOverviewSize(path, cacheEntry.TotalSize)
+	return cacheEntry.TotalSize, nil
+}
+
+func scanOverviewPathCmd(path string, index int) tea.Cmd {
+	return func() tea.Msg {
+		size, err := measureOverviewSize(path)
+		return overviewSizeMsg{
+			path:  path,
+			index: index,
+			size:  size,
+			err:   err,
+		}
+	}
+}
+
+// measureOverviewSize calculates the size of a directory using multiple strategies:
+// 1. Check JSON cache (fast)
+// 2. Try mdls metadata (fast, macOS only)
+// 3. Walk the directory to get logical size (matches detailed scans)
+// 4. Try du command (moderate speed, physical size)
+// 5. Check gob cache (fallback)
+func measureOverviewSize(path string) (int64, error) {
+	if path == "" {
+		return 0, fmt.Errorf("empty path")
+	}
+
+	// Clean and validate path
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return 0, fmt.Errorf("path must be absolute: %s", path)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		return 0, fmt.Errorf("cannot access path: %v", err)
+	}
+
+	// Strategy 1: Check JSON cache
+	if cached, err := loadStoredOverviewSize(path); err == nil && cached > 0 {
+		return cached, nil
+	}
+
+	// Strategy 2: Try mdls (fastest, macOS only)
+	if metadataSize, err := getDirectorySizeFromMetadata(path); err == nil && metadataSize > 0 {
+		_ = storeOverviewSize(path, metadataSize)
+		return metadataSize, nil
+	}
+
+	// Strategy 3: Fall back to a quick logical size walk so the result matches detailed scans.
+	if logicalSize, err := getDirectoryLogicalSize(path); err == nil && logicalSize > 0 {
+		_ = storeOverviewSize(path, logicalSize)
+		return logicalSize, nil
+	}
+
+	// Strategy 4: Try du command (fast and reliable for physical size)
+	if duSize, err := getDirectorySizeFromDu(path); err == nil && duSize > 0 {
+		_ = storeOverviewSize(path, duSize)
+		return duSize, nil
+	}
+
+	// Strategy 5: Check gob cache as fallback
+	if cached, err := loadCacheFromDisk(path); err == nil {
+		_ = storeOverviewSize(path, cached.TotalSize)
+		return cached.TotalSize, nil
+	}
+
+	// If every shortcut fails, bubble the error so caller can display a warning.
+	return 0, fmt.Errorf("unable to measure directory size with fast methods")
+}
+
+// getDirectorySizeFromMetadata attempts to retrieve directory size using macOS Spotlight metadata.
+// This is much faster than filesystem traversal but may not be available for all directories.
+func getDirectorySizeFromMetadata(path string) (int64, error) {
+	// mdls only works on directories
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, fmt.Errorf("cannot stat path: %v", err)
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("not a directory")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mdlsTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "mdls", "-raw", "-name", "kMDItemFSSize", path)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 0, fmt.Errorf("mdls timeout after %v", mdlsTimeout)
+		}
+		if stderr.Len() > 0 {
+			return 0, fmt.Errorf("mdls failed: %v (%s)", err, stderr.String())
+		}
+		return 0, fmt.Errorf("mdls failed: %v", err)
+	}
+	value := strings.TrimSpace(stdout.String())
+	if value == "" || value == "(null)" {
+		return 0, fmt.Errorf("metadata size unavailable")
+	}
+	size, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse mdls output: %v", err)
+	}
+	if size <= 0 {
+		return 0, fmt.Errorf("mdls size invalid: %d", size)
+	}
+	return size, nil
+}
+
+// getDirectorySizeFromDu calculates directory size using the du command.
+// Uses -d 0 to avoid recursing into subdirectories, and includes a timeout protection.
+func getDirectorySizeFromDu(path string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), duTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "du", "-sk", "-d", "0", path)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 0, fmt.Errorf("du timeout after %v", duTimeout)
+		}
+		if stderr.Len() > 0 {
+			return 0, fmt.Errorf("du failed: %v (%s)", err, stderr.String())
+		}
+		return 0, fmt.Errorf("du failed: %v", err)
+	}
+	fields := strings.Fields(stdout.String())
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("du output empty")
+	}
+	kb, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse du output: %v", err)
+	}
+	if kb <= 0 {
+		return 0, fmt.Errorf("du size invalid: %d", kb)
+	}
+	return kb * 1024, nil
+}
+
+// getDirectoryLogicalSize walks the directory tree and sums file sizes to estimate
+// the logical (Finder-style) usage.
+func getDirectoryLogicalSize(path string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil && err != filepath.SkipDir {
+		return 0, err
+	}
+	return total, nil
+}
+
 func snapshotFromModel(m model) historyEntry {
 	return historyEntry{
 		path:          m.path,
@@ -1468,4 +2161,50 @@ func saveCacheToDisk(path string, result scanResult) error {
 
 	encoder := gob.NewEncoder(file)
 	return encoder.Encode(entry)
+}
+
+// getLastAccessTime returns the last access time of a file or directory (macOS only)
+func getLastAccessTime(path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+
+	// Use syscall to get atime on macOS
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return time.Time{}
+	}
+
+	// macOS Darwin stores atime in Atimespec
+	// This is guaranteed to exist on macOS due to build tag
+	return time.Unix(stat.Atimespec.Sec, stat.Atimespec.Nsec)
+}
+
+// formatUnusedTime formats the time since last access in a compact way
+func formatUnusedTime(lastAccess time.Time) string {
+	if lastAccess.IsZero() {
+		return ""
+	}
+
+	duration := time.Since(lastAccess)
+	days := int(duration.Hours() / 24)
+
+	// Only show if unused for more than 3 months
+	if days < 90 {
+		return ""
+	}
+
+	months := days / 30
+	years := days / 365
+
+	if years >= 2 {
+		return fmt.Sprintf(">%dyr unused", years)
+	} else if years >= 1 {
+		return ">1yr unused"
+	} else if months >= 3 {
+		return fmt.Sprintf(">%dmo unused", months)
+	}
+
+	return ""
 }
