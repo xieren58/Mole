@@ -5,9 +5,7 @@ set -euo pipefail
 # Load common functions
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
-
-# Path to optimize-go binary
-OPTIMIZE_GO="$SCRIPT_DIR/bin/optimize-go"
+source "$SCRIPT_DIR/lib/optimize_health.sh"
 
 # Colors and icons from common.sh
 
@@ -433,15 +431,9 @@ main() {
 		exit 1
 	fi
 
-	# Check if optimize-go exists
-	if [[ ! -x "$OPTIMIZE_GO" ]]; then
-		log_error "optimize-go binary not found. Please run: go build -o bin/optimize-go cmd/optimize/main.go"
-		exit 1
-	fi
-
-	# Collect system health data (silent)
+	# Collect system health data using pure Bash implementation
 	local health_json
-	if ! health_json=$("$OPTIMIZE_GO" 2> /dev/null); then
+	if ! health_json=$(generate_health_json 2> /dev/null); then
 		log_error "Failed to collect system health data"
 		exit 1
 	fi
