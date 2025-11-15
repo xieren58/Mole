@@ -844,26 +844,61 @@ perform_cleanup() {
     if command -v brew > /dev/null 2>&1; then
         if [[ "$DRY_RUN" != "true" ]]; then
             if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Homebrew cleanup..."; fi
-            # Run brew cleanup and capture output
-            local brew_output
-            brew_output=$(brew cleanup -s --prune=all 2>&1)
+
+            # Run brew cleanup with timeout (45 seconds max)
+            local brew_output=""
+            local brew_success=false
+            local timeout_seconds=45
+            local brew_tmp_file
+            brew_tmp_file=$(create_temp_file)
+
+            # Run brew cleanup in background with manual timeout
+            (brew cleanup -s --prune=all > "$brew_tmp_file" 2>&1) &
+            local brew_pid=$!
+            local elapsed=0
+
+            # Wait for completion or timeout
+            while kill -0 $brew_pid 2> /dev/null; do
+                if [[ $elapsed -ge $timeout_seconds ]]; then
+                    # Timeout reached - kill the process
+                    kill -TERM $brew_pid 2> /dev/null || true
+                    wait $brew_pid 2> /dev/null || true
+                    break
+                fi
+                sleep 1
+                ((elapsed++))
+            done
+
+            # Check if process completed successfully
+            wait $brew_pid 2> /dev/null && brew_success=true || true
+
             if [[ -t 1 ]]; then stop_inline_spinner; fi
 
-            # Show summary of what was cleaned
-            local removed_count
-            removed_count=$(printf '%s\n' "$brew_output" | grep -c "Removing:" 2> /dev/null || true)
-            removed_count="${removed_count:-0}"
-            local freed_space
-            freed_space=$(printf '%s\n' "$brew_output" | grep -o "[0-9.]*[KMGT]B freed" 2> /dev/null | tail -1 || true)
+            # Read output
+            if [[ -f "$brew_tmp_file" ]]; then
+                brew_output=$(cat "$brew_tmp_file" 2>/dev/null || echo "")
+            fi
 
-            if [[ $removed_count -gt 0 ]] || [[ -n "$freed_space" ]]; then
-                if [[ -n "$freed_space" ]]; then
-                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup ${GREEN}($freed_space)${NC}"
+            if [[ "$brew_success" == "true" && $elapsed -lt $timeout_seconds ]]; then
+                # Show summary of what was cleaned
+                local removed_count
+                removed_count=$(printf '%s\n' "$brew_output" | grep -c "Removing:" 2> /dev/null || true)
+                removed_count="${removed_count:-0}"
+                local freed_space
+                freed_space=$(printf '%s\n' "$brew_output" | grep -o "[0-9.]*[KMGT]B freed" 2> /dev/null | tail -1 || true)
+
+                if [[ $removed_count -gt 0 ]] || [[ -n "$freed_space" ]]; then
+                    if [[ -n "$freed_space" ]]; then
+                        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup ${GREEN}($freed_space)${NC}"
+                    else
+                        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup (${removed_count} items)"
+                    fi
                 else
-                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup (${removed_count} items)"
+                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup"
                 fi
             else
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup"
+                # Timeout or error occurred
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Homebrew cleanup timed out (run 'brew cleanup' manually)"
             fi
         else
             echo -e "  ${YELLOW}→${NC} Homebrew (would cleanup)"
