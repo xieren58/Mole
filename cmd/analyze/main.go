@@ -925,32 +925,6 @@ func (m model) View() string {
 	var b strings.Builder
 	fmt.Fprintln(&b)
 
-	if m.isOverview && hasPendingOverviewEntries(m.entries) {
-		fmt.Fprintf(&b, "%sAnalyze Disk%s\n", colorPurple, colorReset)
-		fmt.Fprintf(&b, "%sPreparing overview...%s\n\n", colorGray, colorReset)
-
-		filesScanned, dirsScanned, bytesScanned := m.getOverviewScanProgress()
-
-		fmt.Fprintf(&b, "%s%s%s%s Scanning: %s%s files%s, %s%s dirs%s, %s%s%s\n",
-			colorCyan, colorBold,
-			spinnerFrames[m.spinner],
-			colorReset,
-			colorYellow, formatNumber(filesScanned), colorReset,
-			colorYellow, formatNumber(dirsScanned), colorReset,
-			colorGreen, humanizeBytes(bytesScanned), colorReset)
-
-		if m.overviewCurrentPath != nil {
-			currentPath := *m.overviewCurrentPath
-			if currentPath != "" {
-				shortPath := displayPath(currentPath)
-				shortPath = truncateMiddle(shortPath, 60)
-				fmt.Fprintf(&b, "%s%s%s\n", colorGray, shortPath, colorReset)
-			}
-		}
-
-		return b.String()
-	}
-
 	if m.deleteConfirm && m.deleteTarget != nil {
 		// Show delete confirmation prominently at the top
 		fmt.Fprintf(&b, "%sDelete: %s (%s)? Press Delete again to confirm, ESC to cancel%s\n\n",
@@ -959,7 +933,12 @@ func (m model) View() string {
 
 	if m.isOverview {
 		fmt.Fprintf(&b, "%sAnalyze Disk%s\n", colorPurple, colorReset)
-		fmt.Fprintf(&b, "%sSelect a location to explore:%s\n", colorGray, colorReset)
+		if m.overviewScanning {
+			fmt.Fprintf(&b, "%sSelect a location to explore:%s  ", colorGray, colorReset)
+			fmt.Fprintf(&b, "%s%s%s%s Scanning...\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset)
+		} else {
+			fmt.Fprintf(&b, "%sSelect a location to explore:%s\n", colorGray, colorReset)
+		}
 	} else {
 		fmt.Fprintf(&b, "%sAnalyze Disk%s  %s%s%s", colorPurple, colorReset, colorGray, displayPath(m.path), colorReset)
 		if !m.scanning {
