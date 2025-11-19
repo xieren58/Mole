@@ -480,7 +480,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tickMsg:
-		if m.scanning || m.deleting || (m.isOverview && m.overviewScanning) {
+		// Keep spinner running if scanning or deleting or if there are pending overview items
+		hasPending := false
+		if m.isOverview {
+			for _, entry := range m.entries {
+				if entry.size < 0 {
+					hasPending = true
+					break
+				}
+			}
+		}
+		if m.scanning || m.deleting || (m.isOverview && (m.overviewScanning || hasPending)) {
 			m.spinner = (m.spinner + 1) % len(spinnerFrames)
 			// Update delete progress status
 			if m.deleting && m.deleteCount != nil {
@@ -709,8 +719,10 @@ func (m *model) switchToOverviewMode() tea.Cmd {
 	cmd := m.scheduleOverviewScans()
 	if cmd == nil {
 		m.status = "Ready"
+		return nil
 	}
-	return cmd
+	// Start tick to animate spinner while scanning
+	return tea.Batch(cmd, tickCmd())
 }
 
 func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
@@ -763,7 +775,7 @@ func (m model) View() string {
 
 	if m.deleteConfirm && m.deleteTarget != nil {
 		// Show delete confirmation prominently at the top
-		fmt.Fprintf(&b, "%sDelete: %s (%s)? Press Delete again to confirm, ESC to cancel%s\n\n",
+		fmt.Fprintf(&b, "%sDelete: %s (%s)? Press Delete again to confirm, ESC to cancel%s\n",
 			colorRed, m.deleteTarget.name, humanizeBytes(m.deleteTarget.size), colorReset)
 	}
 
@@ -781,26 +793,38 @@ func (m model) View() string {
 
 			if allPending {
 				// Show prominent loading screen for initial scan
-				fmt.Fprintf(&b, "\n%s%s%s%s Measuring disk usage across system directories...\n",
+				fmt.Fprintf(&b, "%s%s%s%s Analyzing disk usage, please wait...%s\n",
 					colorCyan, colorBold,
 					spinnerFrames[m.spinner],
-					colorReset)
-				fmt.Fprintf(&b, "%sThis may take a moment on first run%s\n", colorGray, colorReset)
+					colorReset, colorReset)
 				return b.String()
 			} else {
 				// Progressive scanning - show subtle indicator
 				fmt.Fprintf(&b, "%sSelect a location to explore:%s  ", colorGray, colorReset)
-				fmt.Fprintf(&b, "%s%s%s%s Scanning...\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset)
+				fmt.Fprintf(&b, "%s%s%s%s Scanning...\n\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset)
 			}
 		} else {
-			fmt.Fprintf(&b, "%sSelect a location to explore:%s\n", colorGray, colorReset)
+			// Check if there are still pending items
+			hasPending := false
+			for _, entry := range m.entries {
+				if entry.size < 0 {
+					hasPending = true
+					break
+				}
+			}
+			if hasPending {
+				fmt.Fprintf(&b, "%sSelect a location to explore:%s  ", colorGray, colorReset)
+				fmt.Fprintf(&b, "%s%s%s%s Scanning...\n\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset)
+			} else {
+				fmt.Fprintf(&b, "%sSelect a location to explore:%s\n\n", colorGray, colorReset)
+			}
 		}
 	} else {
 		fmt.Fprintf(&b, "%sAnalyze Disk%s  %s%s%s", colorPurple, colorReset, colorGray, displayPath(m.path), colorReset)
 		if !m.scanning {
 			fmt.Fprintf(&b, "  |  Total: %s", humanizeBytes(m.totalSize))
 		}
-		fmt.Fprintln(&b)
+		fmt.Fprintf(&b, "\n\n")
 	}
 
 	if m.deleting {
@@ -810,7 +834,7 @@ func (m model) View() string {
 			count = atomic.LoadInt64(m.deleteCount)
 		}
 
-		fmt.Fprintf(&b, "\n%s%s%s%s Deleting: %s%s items%s removed, please wait...\n",
+		fmt.Fprintf(&b, "%s%s%s%s Deleting: %s%s items%s removed, please wait...\n",
 			colorCyan, colorBold,
 			spinnerFrames[m.spinner],
 			colorReset,
@@ -822,7 +846,7 @@ func (m model) View() string {
 	if m.scanning {
 		filesScanned, dirsScanned, bytesScanned := m.getScanProgress()
 
-		fmt.Fprintf(&b, "\n%s%s%s%s Scanning: %s%s files%s, %s%s dirs%s, %s%s%s\n",
+		fmt.Fprintf(&b, "%s%s%s%s Scanning: %s%s files%s, %s%s dirs%s, %s%s%s\n",
 			colorCyan, colorBold,
 			spinnerFrames[m.spinner],
 			colorReset,
@@ -841,8 +865,6 @@ func (m model) View() string {
 
 		return b.String()
 	}
-
-	fmt.Fprintln(&b)
 
 	if m.showLargeFiles {
 		if len(m.largeFiles) == 0 {
@@ -867,12 +889,12 @@ func (m model) View() string {
 				shortPath := displayPath(file.path)
 				shortPath = truncateMiddle(shortPath, 35)
 				paddedPath := padName(shortPath, 35)
-				entryPrefix := "    "
+				entryPrefix := "   "
 				nameColor := ""
 				sizeColor := colorGray
 				numColor := ""
 				if idx == m.largeSelected {
-					entryPrefix = fmt.Sprintf(" %s%s▶%s  ", colorCyan, colorBold, colorReset)
+					entryPrefix = fmt.Sprintf(" %s%s▶%s ", colorCyan, colorBold, colorReset)
 					nameColor = colorCyan
 					sizeColor = colorCyan
 					numColor = colorCyan
@@ -930,14 +952,14 @@ func (m model) View() string {
 							sizeColor = colorGray
 						}
 					}
-					entryPrefix := "    "
+					entryPrefix := "   "
 					name := trimName(entry.name)
 					paddedName := padName(name, 28)
 					nameSegment := fmt.Sprintf("%s %s", icon, paddedName)
 					numColor := ""
 					percentColor := ""
 					if idx == m.selected {
-						entryPrefix = fmt.Sprintf(" %s%s▶%s  ", colorCyan, colorBold, colorReset)
+						entryPrefix = fmt.Sprintf(" %s%s▶%s ", colorCyan, colorBold, colorReset)
 						nameSegment = fmt.Sprintf("%s%s %s%s", colorCyan, icon, paddedName, colorReset)
 						numColor = colorCyan
 						percentColor = colorCyan
@@ -1011,12 +1033,12 @@ func (m model) View() string {
 					}
 
 					// Keep chart columns aligned even when arrow is shown
-					entryPrefix := "    "
+					entryPrefix := "   "
 					nameSegment := fmt.Sprintf("%s %s", icon, paddedName)
 					numColor := ""
 					percentColor := ""
 					if idx == m.selected {
-						entryPrefix = fmt.Sprintf(" %s%s▶%s  ", colorCyan, colorBold, colorReset)
+						entryPrefix = fmt.Sprintf(" %s%s▶%s ", colorCyan, colorBold, colorReset)
 						nameSegment = fmt.Sprintf("%s%s %s%s", colorCyan, icon, paddedName, colorReset)
 						numColor = colorCyan
 						percentColor = colorCyan

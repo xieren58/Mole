@@ -41,3 +41,6 @@ temp/
 .claude/
 CLAUDE.md
 copilot-instructions.md
+
+# Go build artifacts
+cmd/analyze/analyze
