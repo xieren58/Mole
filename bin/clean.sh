@@ -489,7 +489,7 @@ start_cleanup() {
 
     if [[ "$DRY_RUN" != "true" && -t 0 ]]; then
         echo ""
-        echo -e "${YELLOW}Tip:${NC} Safety first—run 'mo clean --dry-run'. Important Macs should stop."
+        echo -e "${YELLOW}☻${NC} First time? Run ${GRAY}mo clean --dry-run${NC} first to preview changes"
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -734,8 +734,8 @@ perform_cleanup() {
     start_section "Finder metadata"
     if [[ "$PROTECT_FINDER_METADATA" == "true" ]]; then
         note_activity
-        echo -e "  ${GRAY}○${NC} Finder metadata protected by whitelist."
-        echo -e "  ${GRAY}○${NC} Use ${GRAY}mo clean --whitelist${NC} to allow cleaning .DS_Store files."
+        echo -e "  ${YELLOW}☻${NC} Finder metadata protected by whitelist"
+        echo -e "  ${YELLOW}☻${NC} Run ${GRAY}mo clean --whitelist${NC} to allow cleaning .DS_Store files"
     else
         clean_ds_store_tree "$HOME" "Home directory (.DS_Store)"
 
@@ -965,7 +965,7 @@ perform_cleanup() {
                 fi
             else
                 # Timeout or error occurred
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Homebrew cleanup timed out (run 'brew cleanup' manually)"
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Homebrew cleanup timed out (run ${GRAY}brew cleanup${NC} manually)"
             fi
         else
             echo -e "  ${YELLOW}→${NC} Homebrew (would cleanup)"
@@ -1646,13 +1646,13 @@ perform_cleanup() {
     if [[ $node_modules_count -gt 0 ]] || [[ $venv_count -gt 0 ]]; then
         if [[ $node_modules_count -gt 0 ]]; then
             local nm_gb=$(echo "$node_modules_size" | awk '{printf "%.1f", $1/1024/1024}')
-            echo -e "  ${GRAY}○${NC} Found ${YELLOW}${nm_gb}GB${NC} in $node_modules_count old node_modules ${GRAY}(60+ days)${NC}"
+            echo -e "  ${YELLOW}☻${NC} Found ${YELLOW}${nm_gb}GB${NC} in $node_modules_count old node_modules ${GRAY}(60+ days)${NC}"
         fi
         if [[ $venv_count -gt 0 ]]; then
             local venv_gb=$(echo "$venv_size" | awk '{printf "%.1f", $1/1024/1024}')
-            echo -e "  ${GRAY}○${NC} Found ${YELLOW}${venv_gb}GB${NC} in $venv_count old Python venv ${GRAY}(60+ days)${NC}"
+            echo -e "  ${YELLOW}☻${NC} Found ${YELLOW}${venv_gb}GB${NC} in $venv_count old Python venv ${GRAY}(60+ days)${NC}"
         fi
-        echo -e "  ${YELLOW}☻${NC} Run 'mo analyze' to see details and manually clean"
+        echo -e "  ${YELLOW}☻${NC} Run ${GRAY}mo analyze${NC} to see details and manually clean"
     else
         echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No large unused project dependencies found"
     fi

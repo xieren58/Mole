@@ -132,9 +132,9 @@ batch_uninstall_applications() {
     local removal_note="Remove ${app_total} ${app_text}"
     [[ -n "$size_display" ]] && removal_note+=" (${size_display})"
     if [[ ${#running_apps[@]} -gt 0 ]]; then
-        removal_note+=" - will force quit: ${running_apps[*]}"
+        removal_note+=" ${YELLOW}[Running]${NC}"
     fi
-    echo -ne "${PURPLE}${ICON_ARROW}${NC} ${removal_note}. Press ${GREEN}Enter${NC} to confirm, ${GRAY}ESC${NC} to cancel: "
+    echo -ne "${PURPLE}${ICON_ARROW}${NC} ${removal_note}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
 
     IFS= read -r -s -n1 key || key=""
     drain_pending_input # Clean up any escape sequence remnants

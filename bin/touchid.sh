@@ -52,7 +52,7 @@ show_status() {
     if is_touchid_configured; then
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Touch ID is enabled for sudo"
     else
-        echo -e "${YELLOW}○${NC} Touch ID is not configured for sudo"
+        echo -e "${YELLOW}☻${NC} Touch ID is not configured for sudo"
     fi
 }
 

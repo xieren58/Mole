@@ -594,7 +594,7 @@ main() {
     fi
 
     if [[ "$show_touchid_tip" == "true" ]]; then
-        echo -e "Tip: run 'mo touchid' to approve sudo via Touch ID."
+        echo -e "${YELLOW}☻${NC} Run ${GRAY}mo touchid${NC} to approve sudo via Touch ID"
     fi
     print_summary_block "success" "$summary_title" "${summary_details[@]}"
     printf '\n'
