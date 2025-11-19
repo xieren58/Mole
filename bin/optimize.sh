@@ -311,7 +311,7 @@ execute_optimization() {
             local sysconfig="/Library/Preferences/SystemConfiguration"
             if [[ -d "$sysconfig" ]]; then
                 sudo cp "$sysconfig"/com.apple.airport.preferences.plist "$sysconfig"/com.apple.airport.preferences.plist.bak 2> /dev/null || true
-                sudo rm -f "$sysconfig"/com.apple.airport.preferences.plist "$sysconfig"/NetworkInterfaces.plist "$sysconfig"/preferences.plist 2> /dev/null || true
+                sudo rm -f "$sysconfig"/com.apple.airport.preferences.plist 2> /dev/null || true
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Wi-Fi preferences reset"
             else
                 echo -e "  ${GRAY}-${NC} SystemConfiguration directory missing"
