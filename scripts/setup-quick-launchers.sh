@@ -243,6 +243,7 @@ create_raycast_commands() {
         write_raycast_script "$dir/mole-uninstall.sh" "uninstall" "$mo_bin" "uninstall"
         write_raycast_script "$dir/mole-optimize.sh" "optimize" "$mo_bin" "optimize"
         write_raycast_script "$dir/mole-analyze.sh" "analyze" "$mo_bin" "analyze"
+        write_raycast_script "$dir/mole-status.sh" "status" "$mo_bin" "status"
         log_success "Scripts ready in: $dir"
     done
 
@@ -286,6 +287,7 @@ create_alfred_workflow() {
         "fun.tw93.mole.uninstall|Mole uninstall|uninstall|Uninstall apps via Mole|\"${mo_bin}\" uninstall"
         "fun.tw93.mole.optimize|Mole optimize|optimize|System health & optimization|\"${mo_bin}\" optimize"
         "fun.tw93.mole.analyze|Mole analyze|analyze|Disk space analysis|\"${mo_bin}\" analyze"
+        "fun.tw93.mole.status|Mole status|status|Live system dashboard|\"${mo_bin}\" status"
     )
 
     for entry in "${workflows[@]}"; do
@@ -400,11 +402,12 @@ main() {
     create_alfred_workflow "$mo_bin"
 
     echo ""
-    log_success "Done! Raycast and Alfred are ready with 4 commands:"
+    log_success "Done! Raycast and Alfred are ready with 5 commands:"
     echo "  • clean - Deep system cleanup"
     echo "  • uninstall - Remove applications"
     echo "  • optimize - System health & tuning"
     echo "  • analyze - Disk space explorer"
+    echo "  • status - Live system monitor"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 }
