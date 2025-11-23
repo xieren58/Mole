@@ -18,10 +18,10 @@ const (
 	cacheModTimeGrace     = 30 * time.Minute // Ignore minor directory mtime bumps
 
 	// Worker pool configuration
-	minWorkers         = 32               // Minimum workers for better I/O throughput
-	maxWorkers         = 256              // Maximum workers to avoid excessive goroutines
-	cpuMultiplier      = 8                // Worker multiplier per CPU core for I/O-bound operations
-	maxDirWorkers      = 64               // Maximum concurrent subdirectory scans
+	minWorkers         = 8                // Minimum workers for better I/O throughput
+	maxWorkers         = 64               // Maximum workers to avoid excessive goroutines
+	cpuMultiplier      = 2                // Worker multiplier per CPU core for I/O-bound operations
+	maxDirWorkers      = 16               // Maximum concurrent subdirectory scans
 	openCommandTimeout = 10 * time.Second // Timeout for open/reveal commands
 )
 
