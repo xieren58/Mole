@@ -23,25 +23,6 @@ readonly MAX_PARALLEL_JOBS=15 # Maximum parallel background jobs
 readonly TEMP_FILE_AGE_DAYS=7 # Age threshold for temp file cleanup
 readonly ORPHAN_AGE_DAYS=60   # Age threshold for orphaned data
 
-# Timeout helper (GNU timeout isn't available on stock macOS)
-TIMEOUT_BIN=""
-for candidate in gtimeout timeout; do
-    if command -v "$candidate" > /dev/null 2>&1; then
-        TIMEOUT_BIN="$candidate"
-        break
-    fi
-done
-
-run_with_timeout() {
-    local duration="$1"
-    shift
-    if [[ -n "$TIMEOUT_BIN" ]]; then
-        "$TIMEOUT_BIN" "$duration" "$@"
-    else
-        "$@"
-    fi
-}
-
 # Protected Service Worker domains (web-based editing tools)
 readonly PROTECTED_SW_DOMAINS=(
     "capcut.com"

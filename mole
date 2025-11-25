@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 # Version info
-VERSION="1.10.12"
+VERSION="1.10.13"
 MOLE_TAGLINE="can dig deep to clean your Mac."
 
 # Check if Touch ID is already configured
@@ -273,6 +273,21 @@ update_mole() {
     mole_path="$(command -v mole 2> /dev/null || echo "$0")"
     local install_dir
     install_dir="$(cd "$(dirname "$mole_path")" && pwd)"
+
+    local requires_sudo="false"
+    if [[ ! -w "$install_dir" ]]; then
+        requires_sudo="true"
+    elif [[ -e "$install_dir/mole" && ! -w "$install_dir/mole" ]]; then
+        requires_sudo="true"
+    fi
+
+    if [[ "$requires_sudo" == "true" ]]; then
+        if ! request_sudo_access "Mole update requires admin access"; then
+            log_error "Update aborted (admin access denied)"
+            rm -f "$tmp_installer"
+            exit 1
+        fi
+    fi
 
     if [[ -t 1 ]]; then
         start_inline_spinner "Installing update..."
