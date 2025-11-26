@@ -109,7 +109,8 @@ scan_applications() {
 
     # Check if cache exists and is fresh
     if [[ -f "$cache_file" ]]; then
-        local cache_age=$(($(date +%s) - $(stat -f%m "$cache_file" 2> /dev/null || echo 86401)))
+        local cache_age=$(($(date +%s) - $(get_file_mtime "$cache_file")))
+        [[ $cache_age -eq $(date +%s) ]] && cache_age=86401  # Handle missing file
         if [[ $cache_age -lt $cache_ttl ]]; then
             # Cache hit - return immediately
             echo "$cache_file"
@@ -284,7 +285,7 @@ scan_applications() {
                 fi
             else
                 # Fallback to file modification time
-                last_used_epoch=$(stat -f%m "$app_path" 2> /dev/null || echo "0")
+                last_used_epoch=$(get_file_mtime "$app_path")
                 if [[ $last_used_epoch -gt 0 ]]; then
                     local days_ago=$(((current_epoch - last_used_epoch) / 86400))
                     if [[ $days_ago -lt 30 ]]; then
@@ -631,7 +632,8 @@ main() {
     local needs_scanning=true
     local cache_file="$HOME/.cache/mole/app_scan_cache"
     if [[ -f "$cache_file" ]]; then
-        local cache_age=$(($(date +%s) - $(stat -f%m "$cache_file" 2> /dev/null || echo 86401)))
+        local cache_age=$(($(date +%s) - $(get_file_mtime "$cache_file")))
+        [[ $cache_age -eq $(date +%s) ]] && cache_age=86401  # Handle missing file
         [[ $cache_age -lt 86400 ]] && needs_scanning=false
     fi
 

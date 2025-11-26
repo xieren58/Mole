@@ -42,10 +42,41 @@ mo_spinner_chars() {
     printf "%s" "$chars"
 }
 
+# BSD stat compatibility (for users with GNU CoreUtils installed)
+# Always use system BSD stat instead of potentially overridden GNU version
+readonly STAT_BSD="/usr/bin/stat"
+
+get_file_size() {
+    local file="$1"
+    $STAT_BSD -f%z "$file" 2>/dev/null || echo 0
+}
+
+get_file_mtime() {
+    local file="$1"
+    $STAT_BSD -f%m "$file" 2>/dev/null || echo 0
+}
+
+get_file_owner() {
+    local file="$1"
+    $STAT_BSD -f%Su "$file" 2>/dev/null || echo ""
+}
+
 # Security and Path Validation Functions
 
 # Validates a path for safe deletion
-# Returns 0 if path is safe to delete, 1 otherwise
+#
+# Security checks:
+# - Rejects empty paths
+# - Requires absolute paths (must start with /)
+# - Blocks control characters and newlines
+# - Protects critical system directories
+#
+# Args:
+#   $1 - Path to validate
+#
+# Returns:
+#   0 if path is safe to delete
+#   1 if path fails any validation check
 validate_path_for_deletion() {
     local path="$1"
 
@@ -80,8 +111,20 @@ validate_path_for_deletion() {
 }
 
 # Safe wrapper around rm -rf with validation and logging
-# Usage: safe_remove "/path/to/file"
-# Returns 0 on success, 1 on failure
+#
+# Provides a secure alternative to direct rm -rf calls with:
+# - Path validation (absolute paths, no control characters)
+# - System directory protection
+# - Logging of all operations
+# - Silent mode for non-critical failures
+#
+# Usage:
+#   safe_remove "/path/to/file"           # Normal mode with logging
+#   safe_remove "/path/to/file" true      # Silent mode
+#
+# Returns:
+#   0 on success or if path doesn't exist
+#   1 on validation failure or deletion error
 safe_remove() {
     local path="$1"
     local silent="${2:-false}"
@@ -127,7 +170,7 @@ rotate_log_once() {
     export MOLE_LOG_ROTATED=1
 
     local max_size="${MOLE_MAX_LOG_SIZE:-$LOG_MAX_SIZE_DEFAULT}"
-    if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2> /dev/null || echo 0) -gt "$max_size" ]]; then
+    if [[ -f "$LOG_FILE" ]] && [[ $(get_file_size "$LOG_FILE") -gt "$max_size" ]]; then
         mv "$LOG_FILE" "${LOG_FILE}.old" 2> /dev/null || true
         touch "$LOG_FILE" 2> /dev/null || true
     fi
@@ -154,45 +197,10 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >> "$LOG_FILE" 2> /dev/null || true
 }
 
-log_header() {
-    echo -e "\n${PURPLE}${ICON_ARROW} $1${NC}"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SECTION: $1" >> "$LOG_FILE" 2> /dev/null || true
-}
-
 # Call rotation check once when common.sh is sourced
 rotate_log_once
 
 # Icon output helpers
-icon_confirm() {
-    echo -e "${BLUE}${ICON_CONFIRM}${NC} $1"
-}
-
-icon_admin() {
-    echo -e "${BLUE}${ICON_ADMIN}${NC} $1"
-}
-
-icon_success() {
-    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $1"
-}
-
-icon_error() {
-    echo -e "  ${RED}${ICON_ERROR}${NC} $1"
-}
-
-icon_empty() {
-    echo -e "  ${BLUE}${ICON_EMPTY}${NC} $1"
-}
-
-icon_list() {
-    echo -e "  ${ICON_LIST} $1"
-}
-
-icon_menu() {
-    local num="$1"
-    local text="$2"
-    echo -e "${BLUE}${ICON_ARROW} ${num}. ${text}${NC}"
-}
-
 # Consistent summary blocks for command results
 print_summary_block() {
     local heading=""
@@ -417,24 +425,7 @@ show_menu_option() {
 }
 
 # Error handling
-handle_error() {
-    local message="$1"
-    local exit_code="${2:-1}"
-
-    log_error "$message"
-    exit "$exit_code"
-}
-
 # File size utilities
-get_human_size() {
-    local path="$1"
-    if [[ ! -e "$path" ]]; then
-        echo "N/A"
-        return 1
-    fi
-    du -sh "$path" 2> /dev/null | cut -f1 || echo "N/A"
-}
-
 # Convert bytes to human readable format
 bytes_to_human() {
     local bytes="$1"
@@ -479,15 +470,6 @@ bytes_to_human() {
 }
 
 # Calculate directory size in bytes
-get_directory_size_bytes() {
-    local path="$1"
-    if [[ ! -d "$path" ]]; then
-        echo "0"
-        return 1
-    fi
-    du -sk "$path" 2> /dev/null | cut -f1 | awk '{print $1 * 1024}' || echo "0"
-}
-
 # List login items (one per line)
 list_login_items() {
     if ! command -v osascript > /dev/null 2>&1; then
@@ -507,13 +489,6 @@ list_login_items() {
 }
 
 # Permission checks
-check_sudo() {
-    if ! sudo -n true 2> /dev/null; then
-        return 1
-    fi
-    return 0
-}
-
 # Check if Touch ID is configured for sudo
 check_touchid_support() {
     if [[ -f /etc/pam.d/sudo ]]; then
@@ -692,6 +667,19 @@ request_sudo() {
 update_via_homebrew() {
     local version="${1:-unknown}"
 
+    # Set up cleanup trap to kill background process on interruption
+    local brew_pid=""
+    local brew_tmp_file=""
+    cleanup_brew_update() {
+        if [[ -n "$brew_pid" ]] && kill -0 "$brew_pid" 2>/dev/null; then
+            kill -TERM "$brew_pid" 2>/dev/null || true
+            wait "$brew_pid" 2>/dev/null || true
+        fi
+        [[ -n "$brew_tmp_file" ]] && rm -f "$brew_tmp_file"
+        [[ -t 1 ]] && stop_inline_spinner
+    }
+    trap cleanup_brew_update INT TERM
+
     if [[ -t 1 ]]; then
         start_inline_spinner "Updating Homebrew..."
     else
@@ -701,11 +689,10 @@ update_via_homebrew() {
     # Run brew update with timeout to prevent hanging
     # Use background process to allow interruption
     local brew_update_timeout="${MO_BREW_UPDATE_TIMEOUT:-300}"
-    local brew_tmp_file
     brew_tmp_file=$(mktemp -t mole-brew-update 2> /dev/null || echo "/tmp/mole-brew-update.$$")
 
     (brew update > "$brew_tmp_file" 2>&1) &
-    local brew_pid=$!
+    brew_pid=$!
     local elapsed=0
 
     # Wait for completion or timeout
@@ -715,6 +702,7 @@ update_via_homebrew() {
             wait $brew_pid 2> /dev/null || true
             if [[ -t 1 ]]; then stop_inline_spinner; fi
             rm -f "$brew_tmp_file"
+            trap - INT TERM
             log_error "Homebrew update timed out (${brew_update_timeout}s)"
             return 1
         fi
@@ -722,16 +710,28 @@ update_via_homebrew() {
         ((elapsed++))
     done
 
-    wait $brew_pid 2> /dev/null || {
-        if [[ -t 1 ]]; then stop_inline_spinner; fi
-        rm -f "$brew_tmp_file"
-        log_error "Homebrew update failed"
-        return 1
-    }
+    trap - INT TERM
+
+    # Get brew update exit code, but don't fail immediately
+    # brew update can fail for network reasons but we can still check current version
+    wait $brew_pid 2> /dev/null
+    local brew_exit=$?
 
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
+
+    # Check if update failed with a real error (not just "already up-to-date")
+    if [[ $brew_exit -ne 0 ]]; then
+        local update_output=""
+        [[ -f "$brew_tmp_file" ]] && update_output=$(cat "$brew_tmp_file" 2>/dev/null)
+
+        # Only warn if it's a real error, not just "already up-to-date"
+        if [[ -n "$update_output" ]] && ! echo "$update_output" | grep -qi "up-to-date"; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Homebrew update skipped (check network)"
+        fi
+    fi
+
     rm -f "$brew_tmp_file"
 
     if [[ -t 1 ]]; then
@@ -780,35 +780,8 @@ load_config
 # Spinner and Progress Indicators
 # ============================================================================
 
-# Global spinner process IDs
-SPINNER_PID=""
+# Global spinner process ID
 INLINE_SPINNER_PID=""
-
-# Start a full-line spinner with message
-start_spinner() {
-    local message="$1"
-
-    if [[ ! -t 1 ]]; then
-        echo -n "  ${BLUE}|${NC} $message"
-        return
-    fi
-
-    echo -n "  ${BLUE}|${NC} $message"
-    (
-        local delay=0.5
-        while true; do
-            printf "\r${MOLE_SPINNER_PREFIX:-}${BLUE}|${NC} $message.  "
-            sleep $delay
-            printf "\r${MOLE_SPINNER_PREFIX:-}${BLUE}|${NC} $message.. "
-            sleep $delay
-            printf "\r${MOLE_SPINNER_PREFIX:-}${BLUE}|${NC} $message..."
-            sleep $delay
-            printf "\r${MOLE_SPINNER_PREFIX:-}${BLUE}|${NC} $message    "
-            sleep $delay
-        done
-    ) &
-    SPINNER_PID=$!
-}
 
 # Start an inline spinner (rotating character)
 start_inline_spinner() {
@@ -847,27 +820,6 @@ stop_inline_spinner() {
     fi
 }
 
-# Stop spinner with optional result message
-stop_spinner() {
-    local result_message="${1:-Done}"
-
-    stop_inline_spinner
-
-    if [[ -n "$SPINNER_PID" ]]; then
-        kill "$SPINNER_PID" 2> /dev/null || true
-        wait "$SPINNER_PID" 2> /dev/null || true
-        SPINNER_PID=""
-    fi
-
-    if [[ -n "$result_message" ]]; then
-        if [[ -t 1 ]]; then
-            printf "\r${MOLE_SPINNER_PREFIX:-}${GREEN}${ICON_SUCCESS}${NC} %s\n" "$result_message"
-        else
-            echo " ${ICON_SUCCESS} $result_message"
-        fi
-    fi
-}
-
 # ============================================================================
 # User Interaction - Confirmation Dialogs
 # ============================================================================
@@ -899,16 +851,6 @@ create_temp_dir() {
 }
 
 # Create temp file with prefix (for analyze.sh compatibility)
-# Args: $1 - prefix/suffix string
-# Returns: temp file path
-create_temp_file_named() {
-    local suffix="${1:-}"
-    local temp
-    temp=$(mktemp "/tmp/mole_${suffix}_XXXXXX") || return 1
-    MOLE_TEMP_FILES+=("$temp")
-    echo "$temp"
-}
-
 # Cleanup all tracked temp files
 cleanup_temp_files() {
     local file
@@ -929,49 +871,6 @@ cleanup_temp_files() {
 }
 
 # Auto-cleanup on script exit (call this in main scripts)
-register_temp_cleanup() {
-    trap cleanup_temp_files EXIT INT TERM
-}
-
-# ============================================================================
-# Parallel Processing Framework
-# ============================================================================
-
-# Execute commands in parallel with job control
-# Args: $1 - max parallel jobs
-#       $2 - worker function name
-#       $3+ - items to process
-parallel_execute() {
-    local max_jobs="${1:-12}"
-    local worker_func="$2"
-    shift 2
-    local -a items=("$@")
-
-    if [[ ${#items[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    local -a pids=()
-    for item in "${items[@]}"; do
-        # Execute worker function in background
-        "$worker_func" "$item" &
-        pids+=($!)
-
-        # Wait for a slot if we've hit max parallel jobs
-        if ((${#pids[@]} >= max_jobs)); then
-            wait "${pids[0]}" 2> /dev/null || true
-            pids=("${pids[@]:1}")
-        fi
-    done
-
-    # Wait for remaining background jobs
-    if ((${#pids[@]} > 0)); then
-        for pid in "${pids[@]}"; do
-            wait "$pid" 2> /dev/null || true
-        done
-    fi
-}
-
 # ============================================================================
 # Lightweight spinner helper wrappers
 # ============================================================================
@@ -1054,73 +953,16 @@ clean_tool_cache() {
 # Unified action prompt
 # Usage: prompt_action "action" "cancel_text" -> returns 0 for yes, 1 for no
 # Example: prompt_action "enable" "quit" -> "☛ Press Enter to enable, ESC to quit: "
-prompt_action() {
-    local action="$1"
-    local cancel="${2:-cancel}"
-
-    echo ""
-    echo -ne "${PURPLE}${ICON_ARROW}${NC} Press ${GREEN}Enter${NC} to ${action}, ${GRAY}ESC${NC} to ${cancel}: "
-    IFS= read -r -s -n1 key || key=""
-    drain_pending_input # Clean up any escape sequence remnants
-
-    case "$key" in
-        $'\e') # ESC
-            echo ""
-            return 1
-            ;;
-        "" | $'\n' | $'\r')   # Enter
-            printf "\r\033[K" # Clear the prompt line
-            return 0
-            ;;
-        *)
-            echo ""
-            return 1
-            ;;
-    esac
-}
-
-# Legacy confirmation prompt (kept for compatibility)
-# confirm_prompt "Message" -> 0 yes, 1 no
-confirm_prompt() {
-    local message="$1"
-    echo -n "$message (Enter=OK / ESC q=Cancel): "
-    IFS= read -r -s -n1 _key || _key=""
-    drain_pending_input # Clean up any escape sequence remnants
-    case "$_key" in
-        $'\e' | q | Q)
-            echo ""
-            return 1
-            ;;
-        "" | $'\n' | $'\r' | y | Y)
-            echo ""
-            return 0
-            ;;
-        *)
-            echo ""
-            return 1
-            ;;
-    esac
-}
-
 # Get optimal parallel job count based on CPU cores
 
-# =========================================================================
+# ============================================================================
 # Size helpers
-# =========================================================================
+# ============================================================================
 bytes_to_human_kb() { bytes_to_human "$((${1:-0} * 1024))"; }
-print_space_stat() {
-    local freed_kb="$1"
-    shift || true
-    local current_free
-    current_free=$(get_free_space)
-    local human
-    human=$(bytes_to_human_kb "$freed_kb")
-    echo "Space freed: ${GREEN}${human}${NC} | Free space now: $current_free"
-}
 
-# =========================================================================
+# ============================================================================
 # mktemp unification wrappers (register access)
-# =========================================================================
+# ============================================================================
 register_temp_file() { MOLE_TEMP_FILES+=("$1"); }
 register_temp_dir() { MOLE_TEMP_DIRS+=("$1"); }
 
@@ -1130,16 +972,10 @@ mktemp_file() {
     register_temp_file "$f"
     echo "$f"
 }
-mktemp_dir() {
-    local d
-    d=$(mktemp -d) || return 1
-    register_temp_dir "$d"
-    echo "$d"
-}
 
-# =========================================================================
+# ============================================================================
 # Uninstall helper abstractions
-# =========================================================================
+# ============================================================================
 force_kill_app() {
     # Args: app_name [app_path]; tries graceful then force kill; returns 0 if stopped, 1 otherwise
     local app_name="$1"
@@ -1265,25 +1101,6 @@ PY
         return 0
     fi
     return $python_status
-}
-
-map_uninstall_reason() {
-    # Args: reason_token
-    case "$1" in
-        still*running*) echo "was not removed; it remains running and resisted termination." ;;
-        remove*failed*) echo "was not removed due to a removal failure (permissions or protection)." ;;
-        permission*) echo "was not removed due to insufficient permissions." ;;
-        *) echo "was not removed; $1." ;;
-    esac
-}
-
-batch_safe_clean() {
-    # Usage: batch_safe_clean "Label" path1 path2 ...
-    local label="$1"
-    shift || true
-    local -a paths=("$@")
-    if [[ ${#paths[@]} -eq 0 ]]; then return 0; fi
-    safe_clean "${paths[@]}" "$label"
 }
 
 # Get optimal parallel job count based on CPU cores
@@ -1730,16 +1547,6 @@ bundle_matches_pattern() {
     case "$bundle_id" in
         $pattern) return 0 ;;
     esac
-    return 1
-}
-
-should_preserve_bundle() {
-    local bundle_id="$1"
-    for pattern in "${PRESERVED_BUNDLE_PATTERNS[@]}"; do
-        if bundle_matches_pattern "$bundle_id" "$pattern"; then
-            return 0
-        fi
-    done
     return 1
 }
 

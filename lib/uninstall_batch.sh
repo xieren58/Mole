@@ -71,7 +71,7 @@ batch_uninstall_applications() {
         fi
 
         # Check if app requires sudo to delete
-        if [[ ! -w "$(dirname "$app_path")" ]] || [[ "$(stat -f%Su "$app_path" 2> /dev/null)" == "root" ]]; then
+        if [[ ! -w "$(dirname "$app_path")" ]] || [[ "$(get_file_owner "$app_path")" == "root" ]]; then
             sudo_apps+=("$app_name")
         fi
 
@@ -193,7 +193,7 @@ batch_uninstall_applications() {
         local related_files=$(decode_file_list "$encoded_files" "$app_name")
         local reason=""
         local needs_sudo=false
-        [[ ! -w "$(dirname "$app_path")" || "$(stat -f%Su "$app_path" 2> /dev/null)" == "root" ]] && needs_sudo=true
+        [[ ! -w "$(dirname "$app_path")" || "$(get_file_owner "$app_path")" == "root" ]] && needs_sudo=true
         if ! force_kill_app "$app_name" "$app_path"; then
             reason="still running"
         fi
