@@ -231,7 +231,6 @@ EOF
     items+=('radio_refresh|Bluetooth & Wi-Fi Refresh|Reset wireless preference caches|true')
     items+=('recent_items|Recent Items|Clear recent apps/documents/servers lists|true')
     items+=('log_cleanup|Diagnostics Cleanup|Purge old diagnostic & crash logs|true')
-    items+=('finder_dock_refresh|Finder & Dock Refresh|Clear Finder/Dock caches and restart|true')
     items+=('startup_cache|Startup Cache Rebuild|Rebuild kext caches & prelinked kernel|true')
 
     # Conditional items

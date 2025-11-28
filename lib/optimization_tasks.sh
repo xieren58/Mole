@@ -253,6 +253,10 @@ opt_saved_state_cleanup() {
 }
 
 # Finder and Dock: refresh interface caches
+# REMOVED: Deleting Finder cache causes user configuration loss
+# Including window positions, sidebar settings, view preferences, icon sizes
+# Users reported losing Finder settings even with .DS_Store whitelist protection
+# Keep this function for reference but do not use in default optimizations
 opt_finder_dock_refresh() {
     echo -e "${BLUE}${ICON_ARROW}${NC} Resetting Finder & Dock caches..."
     local -a interface_targets=(
